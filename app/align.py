@@ -27,6 +27,14 @@ enumerated per excerpt, then selected jointly across excerpts by located
 count, total characters omitted inside excerpts, characters skipped
 between excerpts, and finally the lexicographically smallest offset
 sequence.
+
+Anchored alignment (``align_quotes_anchored``) is like fuzzy alignment,
+but each quote additionally pins where its match is expected to start:
+only fuzzy candidates whose original start falls within
+``[expected_start - radius, expected_start + radius]`` are enumerated.
+Joint selection ranks by located count, total edit distance, total
+absolute start displacement, skipped characters between located
+segments, and finally the lexicographically smallest offset sequence.
 """
 
 from __future__ import annotations
@@ -94,13 +102,20 @@ def _candidate_spans(
 
 
 def _fuzzy_candidate_spans(
-    norm_text: str, norm_to_orig: list[int], quote: str, max_edits: int
+    norm_text: str,
+    norm_to_orig: list[int],
+    quote: str,
+    max_edits: int,
+    start_window: tuple[int, int] | None = None,
 ) -> list[tuple[int, int, int]]:
     """All ``(start, end, distance)`` fuzzy matches for one quote.
 
     Every non-empty normalized substring whose Unicode-code-point
     Levenshtein distance from the normalized quote is at most ``max_edits``
-    is enumerated; offsets refer to the original text.
+    is enumerated; offsets refer to the original text. When
+    ``start_window`` is given as an ``(orig_lo, orig_hi)`` pair, only
+    candidates whose original start lies within that inclusive window are
+    enumerated.
     """
     norm_quote, _ = _normalize_with_map(quote)
     if not norm_quote.strip():
@@ -110,13 +125,24 @@ def _fuzzy_candidate_spans(
     if n > m + max_edits:
         return []
 
+    # Convert the original-text window into normalized-start bounds; the
+    # normalized -> original map is non-decreasing.
+    if start_window is not None:
+        orig_lo, orig_hi = start_window
+        s_lo = bisect_left(norm_to_orig, orig_lo)
+        s_hi = bisect_right(norm_to_orig, orig_hi) - 1
+        if s_lo >= m or s_hi < s_lo:
+            return []
+    else:
+        s_lo, s_hi = 0, m - 1
+
     # Any matching substring has length in [n-k, n+k]; non-empty only.
     min_len = max(1, n - max_edits)
     max_len = n + max_edits
     inf = max_edits + 1  # Costs above the threshold are equivalent.
 
     candidates: list[tuple[int, int, int]] = []
-    for s in range(m):
+    for s in range(s_lo, s_hi + 1):
         window_len = min(max_len, m - s)
         if window_len < min_len:
             break  # Later starts only get shorter windows.
@@ -494,3 +520,122 @@ def align_quotes_fuzzy(
         for quote, max_edits in quotes
     ]
     return _select_spans(candidates)
+
+
+def _select_anchored_spans(
+    candidates: list[list[tuple[int, int, int]]],
+    expected_starts: list[int],
+) -> list[tuple[int, int, int] | None]:
+    """Jointly pick at most one anchored span per quote.
+
+    Mirrors :func:`_select_spans` (non-overlapping spans keeping quote
+    array order) but ranks selections by located count, total cost, total
+    absolute displacement from ``expected_starts[i]``, skipped original
+    characters between segments, then the lexicographically smallest
+    offset sequence.
+    """
+    n = len(candidates)
+
+    def rank(option: tuple[int, int, int, int, tuple]) -> tuple:
+        count, cost, displacement, skip, seq = option
+        return (-count, cost, displacement, skip, seq)
+
+    @lru_cache(maxsize=None)
+    def dp(i: int, prev_end: int) -> tuple[int, int, int, int, tuple]:
+        # Best (located_count, total_cost, total_displacement,
+        # skipped_chars, span_sequence) for quotes[i:], given the
+        # previously located segment ends at prev_end (-1: none yet).
+        if i == n:
+            return (0, 0, 0, 0, ())
+
+        best = None
+        for start, end, cost in candidates[i]:
+            if prev_end != -1 and start < prev_end:
+                continue
+            count, rest_cost, displacement, skip, seq = dp(i + 1, end)
+            gap = 0 if prev_end == -1 else start - prev_end
+            option = (
+                count + 1,
+                rest_cost + cost,
+                displacement + abs(start - expected_starts[i]),
+                skip + gap,
+                ((start, end),) + seq,
+            )
+            if best is None or rank(option) < rank(best):
+                best = option
+
+        # Leave quote i unlocated.
+        option = dp(i + 1, prev_end)
+        if best is None or rank(option) < rank(best):
+            best = option
+        return best
+
+    # Reconstruct which candidate (if any) realizes the optimum per quote.
+    result: list[tuple[int, int, int] | None] = [None] * n
+    prev_end = -1
+    for i in range(n):
+        best = dp(i, prev_end)
+        for start, end, cost in candidates[i]:
+            if prev_end != -1 and start < prev_end:
+                continue
+            count, rest_cost, displacement, skip, seq = dp(i + 1, end)
+            gap = 0 if prev_end == -1 else start - prev_end
+            if (
+                count + 1,
+                rest_cost + cost,
+                displacement + abs(start - expected_starts[i]),
+                skip + gap,
+                ((start, end),) + seq,
+            ) == best:
+                result[i] = (start, end, cost)
+                prev_end = end
+                break
+    return result
+
+
+def align_quotes_anchored(
+    text: str,
+    quotes: list[tuple[str, int, int, int]],
+) -> list[tuple[int, int, int] | None]:
+    """Locate every anchored quote in ``text`` allowing bounded edits.
+
+    ``quotes`` is a list of ``(quote_text, max_edits, expected_start,
+    radius)`` tuples. For each quote only fuzzy candidates whose original
+    start lies within the inclusive window
+    ``[expected_start - radius, expected_start + radius]`` are enumerated.
+    Returns a list parallel to it; each entry is a ``(start, end,
+    edit_distance)`` triple of character offsets into the original text
+    (end-exclusive), or ``None`` when no candidate lies in the window.
+
+    Quotes are located jointly: the chosen spans must not overlap and must
+    keep the quote array order. Among all feasible selections we
+
+    1. maximize the number of located quotes,
+    2. minimize the total fuzzy edit distance,
+    3. minimize the total absolute displacement ``|start -
+       expected_start|``,
+    4. minimize the total number of original characters skipped between
+       located segments (characters before the first / after the last
+       located segment do not count),
+    5. take the lexicographically smallest offset sequence.
+    """
+    norm_text, norm_to_orig = _normalize_with_map(text)
+    candidates = []
+    expected_starts = []
+    for quote, max_edits, expected_start, radius in quotes:
+        lo = max(0, expected_start - radius)
+        hi = min(len(text), expected_start + radius)
+        candidates.append(
+            sorted(
+                _fuzzy_candidate_spans(
+                    norm_text,
+                    norm_to_orig,
+                    quote,
+                    max_edits,
+                    start_window=(lo, hi),
+                ),
+                key=lambda span: (span[0], span[1]),
+            )
+        )
+        expected_starts.append(expected_start)
+    return _select_anchored_spans(candidates, expected_starts)
