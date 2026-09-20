@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from app.align import (
     align_excerpts,
     align_quotes,
+    align_quotes_anchored,
     align_quotes_fuzzy,
     attribute_quotes,
 )
@@ -682,6 +683,222 @@ def test_attribute_endpoint_rejects_max_edits_above_two():
                 {"id": "b", "text": "world"},
             ],
             "quotes": [{"text": "hallo", "max_edits": 3}],
+        },
+    )
+    assert resp.status_code == 422
+
+# --- core: anchored fuzzy alignment ----------------------------------------
+
+
+def test_anchored_finds_near_expected_start():
+    # Fuzzy match at offset 9 is the only one inside the window; the
+    # identical text at offset 0 lies outside it and must not be selected.
+    text = "foo bar. foo bar"
+    assert align_quotes_anchored(text, [("foo bar", 0, 11, 2)]) == [
+        (9, 16, 0)
+    ]
+
+
+def test_anchored_window_is_inclusive_on_both_sides():
+    text = "ab cd"
+    # The only candidate "ab" starts one original character away from the
+    # anchor; both the -1 and +1 radius boundaries must be accepted.
+    assert align_quotes_anchored(text, [("ab", 0, 1, 1)]) == [(0, 2, 0)]
+    assert align_quotes_anchored(text, [("ab", 0, -1, 1)]) == [(0, 2, 0)]
+
+
+def test_anchored_no_candidate_in_window_returns_none():
+    # "cd" lives at offset 3, but the radius-0 window around 1 excludes it.
+    assert align_quotes_anchored("ab cd", [("cd", 0, 1, 0)]) == [None]
+
+
+def test_anchored_zero_radius_requires_exact_start():
+    text = "foo bar foo"
+    assert align_quotes_anchored(text, [("foo", 0, 8, 0)]) == [(8, 11, 0)]
+    assert align_quotes_anchored(text, [("foo", 0, 7, 0)]) == [None]
+
+
+def test_anchored_minimizes_edit_distance_before_displacement():
+    # Offset 0 is a distance-1 match closer to the anchor, offset 4 is an
+    # exact match farther away; edit distance outranks displacement.
+    text = "foX foo"
+    assert align_quotes_anchored(text, [("foo", 1, 0, 4)]) == [(4, 7, 0)]
+
+
+def test_anchored_minimizes_displacement_before_skipped_chars():
+    # Both "a" candidates cost 0 edits; the one closer to expected_start
+    # wins even though it leaves more skipped text between the segments.
+    text = "aXXXXXXXXa b"
+    assert align_quotes_anchored(
+        text, [("a", 0, 10, 10), ("b", 0, 11, 0)]
+    ) == [(9, 10, 0), (11, 12, 0)]
+
+
+def test_anchored_maximizes_located_count_over_displacement():
+    # The second quote's anchor-near occurrence at 1 overlaps the first
+    # quote; it must move to the displaced occurrence at 4 so both fit,
+    # since located count outranks displacement.
+    text = "abcXbc"
+    assert align_quotes_anchored(
+        text, [("ab", 0, 0, 0), ("bc", 0, 1, 3)]
+    ) == [(0, 2, 0), (4, 6, 0)]
+
+
+def test_anchored_earliest_offset_sequence_on_full_tie():
+    # Both occurrences are equidistant from the anchor and equal on every
+    # other criterion; the earliest offsets win.
+    text = "aXXXa"
+    assert align_quotes_anchored(text, [("a", 0, 2, 2)]) == [(0, 1, 0)]
+
+
+def test_anchored_blank_quote_returns_none():
+    assert align_quotes_anchored(
+        "some text", [("", 1, 0, 10), ("  ", 2, 0, 10)]
+    ) == [None, None]
+
+
+def test_anchored_displacement_can_be_negative():
+    # The window reaches 1 character before the anchor; the only candidate
+    # starts at expected_start - 1.
+    assert align_quotes_anchored("ab cd", [("ab", 0, 1, 1)]) == [(0, 2, 0)]
+
+
+def test_anchored_empty_quote_array():
+    assert align_quotes_anchored("anything", []) == []
+
+
+# --- API: anchored fuzzy alignment ------------------------------------------
+
+
+def test_align_anchored_endpoint():
+    resp = client.post(
+        "/quotes/align-anchored",
+        json={
+            "text": "Archive  text\nwith repeats. Archive text.",
+            "quotes": [
+                {"text": "Archive text", "max_edits": 0,
+                 "expected_start": 0, "radius": 0},
+                {"text": "with", "max_edits": 0,
+                 "expected_start": 13, "radius": 2},
+                {"text": "repeets", "max_edits": 1,
+                 "expected_start": 19, "radius": 2},
+                {"text": "Archlve text", "max_edits": 1,
+                 "expected_start": 30, "radius": 30},
+                {"text": "repeats", "max_edits": 0,
+                 "expected_start": 41, "radius": 0},
+                {"text": "zzz", "max_edits": 0,
+                 "expected_start": 0, "radius": 41},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "results": [
+            {"start": 0, "end": 13, "edit_distance": 0, "displacement": 0},
+            {"start": 14, "end": 18, "edit_distance": 0, "displacement": 1},
+            {"start": 19, "end": 26, "edit_distance": 1, "displacement": 0},
+            {"start": 28, "end": 40, "edit_distance": 1, "displacement": -2},
+            None,
+            None,
+        ]
+    }
+
+
+def test_align_anchored_endpoint_empty_quote_array():
+    resp = client.post(
+        "/quotes/align-anchored",
+        json={"text": "anything", "quotes": []},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"results": []}
+
+
+def test_align_anchored_endpoint_rejects_negative_expected_start():
+    resp = client.post(
+        "/quotes/align-anchored",
+        json={
+            "text": "hello",
+            "quotes": [
+                {"text": "hello", "max_edits": 0,
+                 "expected_start": -1, "radius": 1}
+            ],
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_align_anchored_endpoint_rejects_negative_radius():
+    resp = client.post(
+        "/quotes/align-anchored",
+        json={
+            "text": "hello",
+            "quotes": [
+                {"text": "hello", "max_edits": 0,
+                 "expected_start": 0, "radius": -1}
+            ],
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_align_anchored_endpoint_rejects_expected_start_beyond_text():
+    resp = client.post(
+        "/quotes/align-anchored",
+        json={
+            "text": "hello",
+            "quotes": [
+                {"text": "hello", "max_edits": 0,
+                 "expected_start": 6, "radius": 0}
+            ],
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_align_anchored_endpoint_accepts_expected_start_at_text_length():
+    resp = client.post(
+        "/quotes/align-anchored",
+        json={
+            "text": "hello",
+            "quotes": [
+                {"text": "hello", "max_edits": 0,
+                 "expected_start": 5, "radius": 5}
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "results": [
+            {"start": 0, "end": 5, "edit_distance": 0, "displacement": -5}
+        ]
+    }
+
+
+def test_align_anchored_endpoint_rejects_max_edits_out_of_range():
+    for max_edits in (-1, 3):
+        resp = client.post(
+            "/quotes/align-anchored",
+            json={
+                "text": "hello",
+                "quotes": [
+                    {"text": "hello", "max_edits": max_edits,
+                     "expected_start": 0, "radius": 1}
+                ],
+            },
+        )
+        assert resp.status_code == 422
+
+
+def test_align_anchored_endpoint_rejects_missing_fields():
+    resp = client.post(
+        "/quotes/align-anchored", json={"text": "hello"}
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        "/quotes/align-anchored",
+        json={
+            "text": "hello",
+            "quotes": [{"text": "hello", "max_edits": 0, "radius": 1}],
         },
     )
     assert resp.status_code == 422

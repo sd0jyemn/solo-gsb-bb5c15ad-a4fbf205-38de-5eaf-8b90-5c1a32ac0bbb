@@ -1,17 +1,18 @@
 """Archive quote-alignment API."""
 
 from fastapi import FastAPI
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .align import (
     MAX_ALLOWED_EDITS,
     align_excerpts,
     align_quotes,
+    align_quotes_anchored,
     align_quotes_fuzzy,
     attribute_quotes,
 )
 
-app = FastAPI(title="Archive Quote Alignment API", version="1.3.0")
+app = FastAPI(title="Archive Quote Alignment API", version="1.4.0")
 
 
 class AlignRequest(BaseModel):
@@ -36,6 +37,40 @@ class FuzzyAlignRequest(BaseModel):
     quotes: list[FuzzyQuote] = Field(
         ..., description="Quotes to locate, matched in array order"
     )
+
+
+class AnchoredQuote(FuzzyQuote):
+    expected_start: int = Field(
+        ...,
+        ge=0,
+        description="Expected original-text start offset of the quote",
+    )
+    radius: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "Only candidates whose start lies within "
+            "[expected_start-radius, expected_start+radius] are enumerated"
+        ),
+    )
+
+
+class AnchoredAlignRequest(BaseModel):
+    text: str = Field(..., description="Original source text")
+    quotes: list[AnchoredQuote] = Field(
+        ..., description="Quotes to locate, matched in array order"
+    )
+
+    @model_validator(mode="after")
+    def expected_starts_must_fit_text(self) -> "AnchoredAlignRequest":
+        text_length = len(self.text)
+        for index, quote in enumerate(self.quotes):
+            if quote.expected_start > text_length:
+                raise ValueError(
+                    f"quotes[{index}].expected_start must not exceed the "
+                    f"original text length ({text_length})"
+                )
+        return self
 
 
 class Excerpt(BaseModel):
@@ -137,6 +172,19 @@ class FuzzyAlignResponse(BaseModel):
     )
 
 
+class AnchoredSpan(FuzzySpan):
+    displacement: int = Field(
+        ...,
+        description="Signed displacement of the located start: start - expected_start",
+    )
+
+
+class AnchoredAlignResponse(BaseModel):
+    results: list[AnchoredSpan | None] = Field(
+        ..., description="One entry per quote; null when the quote is not located"
+    )
+
+
 class ExcerptAlignment(BaseModel):
     start: int = Field(
         ..., description="Start offset of the excerpt in the original text"
@@ -199,6 +247,35 @@ def align_fuzzy(request: FuzzyAlignRequest) -> FuzzyAlignResponse:
             if span is not None
             else None
             for span in spans
+        ]
+    )
+
+
+@app.post("/quotes/align-anchored", response_model=AnchoredAlignResponse)
+def align_anchored(request: AnchoredAlignRequest) -> AnchoredAlignResponse:
+    spans = align_quotes_anchored(
+        request.text,
+        [
+            (
+                quote.text,
+                quote.max_edits,
+                quote.expected_start,
+                quote.radius,
+            )
+            for quote in request.quotes
+        ],
+    )
+    return AnchoredAlignResponse(
+        results=[
+            AnchoredSpan(
+                start=span[0],
+                end=span[1],
+                edit_distance=span[2],
+                displacement=span[0] - quote.expected_start,
+            )
+            if span is not None
+            else None
+            for span, quote in zip(spans, request.quotes)
         ]
     )
 

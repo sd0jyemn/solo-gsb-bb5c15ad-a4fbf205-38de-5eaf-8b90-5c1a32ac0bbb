@@ -1,6 +1,6 @@
 # Archive Quote Alignment API
 
-档案引文定位服务：给定原文与一组有序引文，返回每条引文在原文中的字符起止偏移；除精确匹配外，还支持允许少量编辑的模糊定位、由 2～5 个有序片段组成的节录定位，以及在多份文档之间为引文选择归属文档。
+档案引文定位服务：给定原文与一组有序引文，返回每条引文在原文中的字符起止偏移；除精确匹配外，还支持允许少量编辑的模糊定位、带期望起点与半径约束的锚定模糊定位、由 2～5 个有序片段组成的节录定位，以及在多份文档之间为引文选择归属文档。
 
 ## 启动
 
@@ -72,8 +72,44 @@ docker compose up --build
 }
 ```
 
-### `POST /quotes/align-excerpts`（有序节录匹配）
+### `POST /quotes/align-anchored`（锚定模糊匹配）
 
+在 `/quotes/align-fuzzy` 的基础上，每条引文额外提供 `expected_start`（期望的**原文**起点，非负且不超过原文长度）与 `radius`（非负）。仅枚举**原始起点**落在闭区间 `[expected_start-radius, expected_start+radius]` 内的模糊候选；`expected_start` 或 `radius` 为负、`expected_start` 超过原文长度、或 `max_edits` 越界时返回 422。
+
+请求体：
+
+```json
+{
+  "text": "Archive  text\nwith repeats. Archive text.",
+  "quotes": [
+    {"text": "Archive text", "max_edits": 0, "expected_start": 0, "radius": 0},
+    {"text": "with", "max_edits": 0, "expected_start": 13, "radius": 2},
+    {"text": "repeets", "max_edits": 1, "expected_start": 19, "radius": 2},
+    {"text": "Archlve text", "max_edits": 1, "expected_start": 30, "radius": 30},
+    {"text": "repeats", "max_edits": 0, "expected_start": 41, "radius": 0},
+    {"text": "zzz", "max_edits": 0, "expected_start": 0, "radius": 41}
+  ]
+}
+```
+
+响应（在 `start`/`end`/`edit_distance` 之外多返回 `displacement`，即实际起点相对期望起点的**带符号**偏移 `start - expected_start`，可为负；窗口内无候选或无法联合放入时为 `null`）：
+
+```json
+{
+  "results": [
+    {"start": 0, "end": 13, "edit_distance": 0, "displacement": 0},
+    {"start": 14, "end": 18, "edit_distance": 0, "displacement": 1},
+    {"start": 19, "end": 26, "edit_distance": 1, "displacement": 0},
+    {"start": 28, "end": 40, "edit_distance": 1, "displacement": -2},
+    null,
+    null
+  ]
+}
+```
+
+第 5 条引文要求起点严格等于原文长度（`radius=0`），无可用片段；第 6 条在全文中都不存在；二者均为 `null`。
+
+### `POST /quotes/align-excerpts`（有序节录匹配）
 每条节录（excerpt）由 **2～5 个非空白** `fragments` 与 `max_gap`（相邻片段在**原文**中允许的最大间隔字符数，取值 **0～10000**）组成。片段按精确匹配（空白折叠）定位；一条节录命中要求全部片段按数组顺序依次出现、互不重叠，且相邻片段在原文中的间隔不超过 `max_gap`。片段数为 1 或超过 5、含空白片段、`max_gap` 越界或缺失时返回 422。
 
 请求体：
@@ -154,13 +190,20 @@ docker compose up --build
 ## 匹配规则
 
 - **空白折叠**：匹配时先将原文与引文中的连续空白（空格、换行、制表符等）折叠为单个空格；返回的偏移始终指向原始文本的原始字符。
-- **模糊编辑距离**（`/quotes/align-fuzzy` 与 `/quotes/attribute`）：在空白折叠之后，以 **Unicode 字符（码位）** 为单位计算 Levenshtein 距离，插入、删除、替换均计为 1；枚举归一化原文中所有距离不超过该引文 `max_edits`（0～2）的非空片段。
+- **模糊编辑距离**（`/quotes/align-fuzzy`、`/quotes/align-anchored` 与 `/quotes/attribute`）：在空白折叠之后，以 **Unicode 字符（码位）** 为单位计算 Levenshtein 距离，插入、删除、替换均计为 1；枚举归一化原文中所有距离不超过该引文 `max_edits`（0～2）的非空片段。
+- **锚定窗口**（仅 `/quotes/align-anchored`）：每条引文只保留**原始起点**位于 `[expected_start-radius, expected_start+radius]` 的模糊候选（区间越出原文边界时自动截断到 `[0, 原文长度]`；注意原文长度处没有非空片段，可能因此未命中）。`expected_start`、`radius` 必须非负且 `expected_start` 不得超过原文长度，否则返回 422。
 - **重复引文**：同一引文出现多次时，各次匹配互不重叠，且保持引文数组的顺序。
 - **联合选择**（`/quotes/align` 与 `/quotes/align-fuzzy`）：从各引文的候选位置中整体选出一组互不重叠、保持数组顺序的定位，目标依次为：
   1. 最大化成功定位的引文条数；
   2. 最小化总编辑距离（精确匹配恒为 0；仅模糊接口涉及）；
   3. 最小化已定位片段之间跳过的原文字符总数（首段之前、末段之后不计）；
   4. 仍并列时取偏移序列字典序最小（最早）的一组。
+- **锚定联合选择**（仅 `/quotes/align-anchored`）：在锚定窗口候选之上做与上面相同的互不重叠、保序联合选择，目标依次为：
+  1. 最大化成功定位的引文条数；
+  2. 最小化总编辑距离；
+  3. 最小化总起点偏移绝对值（各命中片段 `|start - expected_start|` 之和）；
+  4. 最小化已定位片段之间跳过的原文字符总数（首段之前、末段之后不计）；
+  5. 仍并列时取偏移序列字典序最小（最早）的一组。命中结果中的 `displacement` 为带符号偏移 `start - expected_start`，未命中为 `null`。
 - **多文档归属**（仅 `/quotes/attribute`）：为每条引文从全部文档的模糊候选中整体选出至多一个「文档 + 偏移」，同一文档内的已选片段须按引文顺序且不重叠，目标依次为：
   1. 最大化成功定位的引文条数；
   2. 最小化总编辑距离；
